@@ -1,7 +1,5 @@
-require('dotenv').config();
-
 const TelegramBot = require('node-telegram-bot-api');
-const ytdlp = require('yt-dlp-exec');
+const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -24,6 +22,54 @@ function ensureDownloadsDir() {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 }
 
+function execAsync(command) {
+  return new Promise((resolve, reject) => {
+    exec(command, { windowsHide: true, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        const details = stderr || stdout || error.message;
+        reject(new Error(details));
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+function getLatestFileInDownloads() {
+  ensureDownloadsDir();
+  const files = fs
+    .readdirSync(DOWNLOADS_DIR)
+    .map((name) => path.join(DOWNLOADS_DIR, name))
+    .filter((p) => fs.existsSync(p) && fs.statSync(p).isFile());
+
+  if (files.length === 0) return null;
+  files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  return files[0];
+}
+
+// Uses system-installed yt-dlp (assumed available in PATH).
+// - type: "mp4" or "mp3"
+// - After download completes, we pick the latest file in ./downloads and return its path.
+async function downloadMedia(url, type) {
+  ensureDownloadsDir();
+
+  const outputTemplate = path.join(DOWNLOADS_DIR, '%(title)s.%(ext)s');
+  const outputArg = `"${outputTemplate}"`;
+  const urlArg = `"${url}"`;
+
+  // Note: we do NOT install yt-dlp in code; the environment must provide it.
+  const cmd =
+    type === 'mp3'
+      ? `yt-dlp -x --audio-format mp3 -o ${outputArg} ${urlArg}`
+      : `yt-dlp -f "best[filesize<50M]" -o ${outputArg} ${urlArg}`;
+
+  await execAsync(cmd);
+
+  const latest = getLatestFileInDownloads();
+  if (!latest) throw new Error('No file found after download');
+  return latest;
+}
+
 function extractFirstUrl(text) {
   if (!text) return null;
   const match = text.match(/https?:\/\/\S+/i);
@@ -39,58 +85,7 @@ function isValidHttpUrl(str) {
   }
 }
 
-function parseRequestedType(text) {
-  const t = (text || '').trim().toLowerCase();
-  if (t.startsWith('/mp3')) return 'mp3';
-  if (t.startsWith('/mp4')) return 'mp4';
-  return 'mp4';
-}
-
-async function downloadMediaUnderLimit(url, messageId, type) {
-  ensureDownloadsDir();
-
-  // Prefix output with messageId to reliably locate the downloaded file.
-  const outTemplate = path.join(DOWNLOADS_DIR, `${messageId}-%(id)s.%(ext)s`);
-
-  const baseOpts = {
-    output: outTemplate,
-    maxFilesize: '50M',
-    noWarnings: true,
-    noPlaylist: true
-  };
-
-  if (type === 'mp3') {
-    const format = 'bestaudio[filesize<=50M]/bestaudio/best[filesize<=50M]/best';
-    await ytdlp(url, {
-      ...baseOpts,
-      format,
-      extractAudio: true,
-      audioFormat: 'mp3',
-      audioQuality: '0'
-    });
-  } else {
-    // Try hard to keep the result under 50MB.
-    // - Prefer a combined best video+audio where each stream respects filesize constraint.
-    // - Fallback progressively to simpler/best options.
-    const format =
-      'bv*[filesize<=50M]+ba[filesize<=50M]/b[filesize<=50M]/best[filesize<=50M]/best';
-
-    await ytdlp(url, {
-      ...baseOpts,
-      format,
-      mergeOutputFormat: 'mp4'
-    });
-  }
-
-  const files = fs
-    .readdirSync(DOWNLOADS_DIR)
-    .filter((f) => f.startsWith(`${messageId}-`))
-    .map((f) => path.join(DOWNLOADS_DIR, f));
-
-  if (files.length === 0) return null;
-  files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-  return files[0];
-}
+// NOTE: previous yt-dlp-exec based downloader was removed per requirement.
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
@@ -131,7 +126,7 @@ bot.on('callback_query', async (cq) => {
       message_id: msg.message_id
     });
 
-    filePath = await downloadMediaUnderLimit(url, msg.message_id, type);
+    filePath = await downloadMedia(url, type);
     if (!filePath || !fs.existsSync(filePath)) {
       await bot.editMessageText('Download failed', {
         chat_id: msg.chat.id,
